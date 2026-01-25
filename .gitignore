@@ -1,0 +1,17 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Executables
+*.exe
+*.dll
+
+# IDE/Editor settings
+.vscode/
+.idea/
+*.swp
+
+# OS generated files
+thumbs.db
+Desktop.ini
+.DS_Store

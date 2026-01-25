@@ -8,6 +8,7 @@
 #include <wincodec.h>
 #include <math.h>
 #include <stdint.h>
+#include <wchar.h>
 
 #include "avif.h"
 
@@ -29,6 +30,38 @@ static float c3 = 2392 / 128.f;
 
 float pq_inv_eotf(float y) {
     return powf((c1 + c2 * powf(y, m1)) / (1 + c3 * powf(y, m1)), m2);
+}
+
+// Helper to convert 16-bit float (half) to 32-bit float
+float halfToFloat(uint16_t h) {
+    uint32_t s = (h >> 15) & 0x00000001;
+    uint32_t e = (h >> 10) & 0x0000001f;
+    uint32_t m = h & 0x000003ff;
+    uint32_t r;
+    if (e == 0) {
+        if (m == 0) {
+            // Zero
+            r = s << 31;
+        } else {
+            // Denormal
+            while (!(m & 0x00000400)) {
+                m <<= 1;
+                e -= 1;
+            }
+            e += 1;
+            m &= ~0x00000400;
+            r = (s << 31) | ((e + 112) << 23) | (m << 13);
+        }
+    } else if (e == 31) {
+        // Inf/NaN
+        r = (s << 31) | 0x7f800000 | (m << 13);
+    } else {
+        // Normalized
+        r = (s << 31) | ((e + 112) << 23) | (m << 13);
+    }
+    float f;
+    memcpy(&f, &r, sizeof(f));
+    return f;
 }
 
 static const float scrgb_to_bt2100[3][3] = {
@@ -85,9 +118,10 @@ DWORD WINAPI ThreadFunc(LPVOID lpParam) {
                 matrixVectorMult((float *) pixels + i * 4 * width + 4 * j, bt2020, scrgb_to_bt2100);
             } else {
                 float cur[3];
-                _Float16 *cur16 = (_Float16 *) pixels + i * 4 * width + 4 * j;
+                // Use uint16_t instead of _Float16 for compatibility
+                uint16_t *cur16 = (uint16_t *) pixels + i * 4 * width + 4 * j;
                 for (int k = 0; k < 3; k++) {
-                    cur[k] = (float) cur16[k];
+                    cur[k] = halfToFloat(cur16[k]);
                 }
                 matrixVectorMult(cur, bt2020, scrgb_to_bt2100);
             }
@@ -121,44 +155,16 @@ DWORD WINAPI ThreadFunc(LPVOID lpParam) {
     return 0;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc <= 1 || argc > 3 == strcmp(argv[1], "--speed") || argc > 5) {
-        fprintf(stderr, "jxr_to_avif [--speed n] input.jxr [output.avif]\n");
-        return 1;
-    }
+// Helper to check if a path is a directory
+BOOL IsDirectory(LPCWSTR path) {
+    DWORD attributes = GetFileAttributesW(path);
+    return (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY));
+}
 
-    int speed = DEFAULT_SPEED;
-    LPWSTR inputFile;
-    LPWSTR outputFile = L"output.avif";
-
-    {
-        LPWSTR *szArglist;
-        int nArgs;
-
-        szArglist = CommandLineToArgvW(GetCommandLineW(), &nArgs);
-        if (NULL == szArglist) {
-            fprintf(stderr, "CommandLineToArgvW failed\n");
-            return 1;
-        }
-
-        int rest = 1;
-
-        if (!strcmp("--speed", argv[1])) {
-            speed = atoi(argv[2]);
-            if (speed < AVIF_SPEED_SLOWEST || speed > AVIF_SPEED_FASTEST) {
-                fprintf(stderr, "Speed must be in range [%d, %d]", AVIF_SPEED_SLOWEST, AVIF_SPEED_FASTEST);
-                return 1;
-            }
-            rest += 2;
-        }
-
-        inputFile = szArglist[rest + 0];
-
-        if (rest + 1 < argc) {
-            outputFile = szArglist[rest + 1];
-        }
-    }
-
+// Function to convert a single file
+int convert_file(LPCWSTR inputFile, LPCWSTR outputFile, int speed) {
+    printf("Processing: %ls -> %ls\n", inputFile, outputFile);
+    
     // Create a decoder
     IWICBitmapDecoder *pDecoder = NULL;
 
@@ -191,7 +197,8 @@ int main(int argc, char *argv[]) {
     );
 
     if (FAILED(hr)) {
-        fprintf(stderr, "Failed to open file\n");
+        fprintf(stderr, "Failed to open file: %ls\n", inputFile);
+        if (pFactory) pFactory->lpVtbl->Release(pFactory);
         return 1;
     }
 
@@ -202,6 +209,8 @@ int main(int argc, char *argv[]) {
 
     if (FAILED(hr)) {
         fprintf(stderr, "Failed to get frame\n");
+        if (pDecoder) pDecoder->lpVtbl->Release(pDecoder);
+        if (pFactory) pFactory->lpVtbl->Release(pFactory);
         return 1;
     }
 
@@ -211,6 +220,9 @@ int main(int argc, char *argv[]) {
 
     if (FAILED(hr)) {
         fprintf(stderr, "Failed to get IWICBitmapSource\n");
+        if (pFrame) pFrame->lpVtbl->Release(pFrame);
+        if (pDecoder) pDecoder->lpVtbl->Release(pDecoder);
+        if (pFactory) pFactory->lpVtbl->Release(pFactory);
         return 1;
     }
 
@@ -253,9 +265,9 @@ int main(int argc, char *argv[]) {
     SYSTEM_INFO systemInfo;
     GetSystemInfo(&systemInfo);
     uint32_t numThreads = systemInfo.dwNumberOfProcessors;
-    printf("Using %d threads\n", numThreads);
+    // printf("Using %d threads\n", numThreads); // Reduced verbosity for bulk processing
 
-    puts("Converting pixels to BT.2100 PQ...");
+    // puts("Converting pixels to BT.2100 PQ...");
 
     uint16_t maxCLL, maxPALL;
 
@@ -296,9 +308,15 @@ int main(int argc, char *argv[]) {
             chunkSize = 1;
         }
 
-        HANDLE hThreadArray[convThreads];
-        ThreadData *threadData[convThreads];
-        DWORD dwThreadIdArray[convThreads];
+        // Fix VLA (Variable Length Array) by using malloc
+        HANDLE *hThreadArray = malloc(sizeof(HANDLE) * convThreads);
+        ThreadData **threadData = malloc(sizeof(ThreadData*) * convThreads);
+        DWORD *dwThreadIdArray = malloc(sizeof(DWORD) * convThreads);
+
+        if (!hThreadArray || !threadData || !dwThreadIdArray) {
+            fprintf(stderr, "Failed to allocate thread arrays\n");
+            return 1;
+        }
 
         for (uint32_t i = 0; i < convThreads; i++) {
             threadData[i] = malloc(sizeof(ThreadData));
@@ -383,6 +401,11 @@ int main(int argc, char *argv[]) {
 #endif
             free(threadData[i]);
         }
+        
+        // Free thread arrays
+        free(hThreadArray);
+        free(threadData);
+        free(dwThreadIdArray);
 
         maxPALL = (uint16_t) round(10000 * (sumOfMaxComp / (double) ((uint64_t) width * height)));
 
@@ -401,16 +424,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Out of memory\n");
         goto cleanup;
     }
-    // Configure image here: (see avif/avif.h)
-    // * colorPrimaries
-    // * transferCharacteristics
-    // * matrixCoefficients
-    // * avifImageSetProfileICC()
-    // * avifImageSetMetadataExif()
-    // * avifImageSetMetadataXMP()
-    // * yuvRange
-    // * alphaPremultiplied
-    // * transforms (transformFlags, pasp, clap, irot, imir)
+    // Configure image here: (see avif/avif.h) 
+    
     image->colorPrimaries = AVIF_COLOR_PRIMARIES_BT2020;
     image->transferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084;
 
@@ -420,13 +435,13 @@ int main(int argc, char *argv[]) {
     image->matrixCoefficients = AVIF_MATRIX_COEFFICIENTS_BT2020_NCL;
 #endif
 
-    printf("Computed HDR metadata: %u MaxCLL, %u MaxPALL\n", maxCLL, maxPALL);
+    // printf("Computed HDR metadata: %u MaxCLL, %u MaxPALL\n", maxCLL, maxPALL);
 
     image->clli.maxCLL = maxCLL;
     image->clli.maxPALL = maxPALL;
 
     // If you have RGB(A) data you want to encode, use this path
-    printf("Doing AVIF encoding...\n");
+    // printf("Doing AVIF encoding...\n");
 
     avifRGBImageSetDefaults(&rgb, image);
     // Override RGB(A)->YUV(A) defaults here:
@@ -442,7 +457,7 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
-    free(rgb.pixels);
+    // free(rgb.pixels); // Removed double free: rgb.pixels aliases converted, which is freed at cleanup
 
     encoder = avifEncoderCreate();
     if (!encoder) {
@@ -450,14 +465,7 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
     // Configure your encoder here (see avif/avif.h):
-    // * maxThreads
-    // * quality
-    // * qualityAlpha
-    // * tileRowsLog2
-    // * tileColsLog2
-    // * speed
-    // * keyframeInterval
-    // * timescale
+    
     encoder->quality = AVIF_QUALITY_LOSSLESS;
     encoder->qualityAlpha = AVIF_QUALITY_LOSSLESS;
     encoder->speed = speed;
@@ -465,8 +473,6 @@ int main(int argc, char *argv[]) {
     encoder->autoTiling = USE_TILING;
 
     // Call avifEncoderAddImage() for each image in your sequence
-    // Only set AVIF_ADD_IMAGE_FLAG_SINGLE if you're not encoding a sequence
-    // Use avifEncoderAddImageGrid() instead with an array of avifImage* to make a grid image
     avifResult addImageResult = avifEncoderAddImage(encoder, image, 1, AVIF_ADD_IMAGE_FLAG_SINGLE);
     if (addImageResult != AVIF_RESULT_OK) {
         fprintf(stderr, "Failed to add image to encoder: %s\n", avifResultToString(addImageResult));
@@ -479,9 +485,13 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
-    printf("Encode success: %zu total bytes\n", avifOutput.size);
+    // printf("Encode success: %zu total bytes\n", avifOutput.size);
 
     FILE *f = _wfopen(outputFile, L"wb");
+    if (!f) {
+        fprintf(stderr, "Failed to open output file: %ls\n", outputFile);
+        goto cleanup;
+    }
     size_t bytesWritten = fwrite(avifOutput.data, 1, avifOutput.size, f);
     fclose(f);
     if (bytesWritten != avifOutput.size) {
@@ -499,5 +509,135 @@ int main(int argc, char *argv[]) {
         avifEncoderDestroy(encoder);
     }
     avifRWDataFree(&avifOutput);
+    
+    // Release WIC resources
+    if (pBitmapSource) pBitmapSource->lpVtbl->Release(pBitmapSource);
+    if (pFrame) pFrame->lpVtbl->Release(pFrame);
+    if (pDecoder) pDecoder->lpVtbl->Release(pDecoder);
+    if (pFactory) pFactory->lpVtbl->Release(pFactory);
+    if (converted) free(converted);
+    
     return returnCode;
+}
+
+// Recursively scan directory
+void process_path(LPCWSTR path, int speed, LPCWSTR outputOverride) {
+    if (IsDirectory(path)) {
+        if (outputOverride != NULL) {
+            printf("Warning: Output filename '%ls' ignored when processing directory '%ls'.\n", outputOverride, path);
+        }
+
+        WCHAR searchPath[MAX_PATH];
+        swprintf(searchPath, MAX_PATH, L"%ls\\*", path);
+
+        // Debug print
+        // wprintf(L"Searching: %ls\n", searchPath);
+
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW(searchPath, &findData);
+
+        if (hFind == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            fprintf(stderr, "Failed to list directory: %ls (Error Code: %lu)\n", path, err);
+            return;
+        }
+
+        do {
+            if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) {
+                continue;
+            }
+
+            WCHAR fullPath[MAX_PATH];
+            swprintf(fullPath, MAX_PATH, L"%ls\\%ls", path, findData.cFileName);
+
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                process_path(fullPath, speed, NULL);
+            } else {
+                // Check extension
+                LPCWSTR ext = wcsrchr(findData.cFileName, L'.');
+                if (ext && (_wcsicmp(ext, L".jxr") == 0)) {
+                    // Generate output path
+                    WCHAR outPath[MAX_PATH];
+                    wcscpy(outPath, fullPath);
+                    WCHAR *dot = wcsrchr(outPath, L'.');
+                    if (dot) {
+                        wcscpy(dot, L".avif");
+                    } else {
+                        wcscat(outPath, L".avif");
+                    }
+                    convert_file(fullPath, outPath, speed);
+                }
+            }
+        } while (FindNextFileW(hFind, &findData) != 0);
+
+        FindClose(hFind);
+    } else {
+        // It's a file
+        WCHAR outPath[MAX_PATH];
+        if (outputOverride) {
+            wcscpy(outPath, outputOverride);
+        } else {
+            wcscpy(outPath, path);
+            WCHAR *dot = wcsrchr(outPath, L'.');
+            if (dot) {
+                wcscpy(dot, L".avif");
+            } else {
+                wcscat(outPath, L".avif");
+            }
+        }
+        convert_file(path, outPath, speed);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    int speed = DEFAULT_SPEED;
+    LPWSTR inputPath = NULL;
+    LPWSTR outputPath = NULL;
+
+    // Parse command line arguments
+    LPWSTR *szArglist;
+    int nArgs;
+    szArglist = CommandLineToArgvW(GetCommandLineW(), &nArgs);
+    if (NULL == szArglist) {
+        fprintf(stderr, "CommandLineToArgvW failed\n");
+        return 1;
+    }
+
+    int argIdx = 1;
+    while (argIdx < nArgs) {
+        if (!wcscmp(L"--speed", szArglist[argIdx])) {
+            if (argIdx + 1 < nArgs) {
+                speed = _wtoi(szArglist[argIdx + 1]);
+                if (speed < AVIF_SPEED_SLOWEST || speed > AVIF_SPEED_FASTEST) {
+                    fprintf(stderr, "Speed must be in range [%d, %d]\n", AVIF_SPEED_SLOWEST, AVIF_SPEED_FASTEST);
+                    LocalFree(szArglist);
+                    return 1;
+                }
+                argIdx += 2;
+            } else {
+                fprintf(stderr, "Missing value for --speed\n");
+                LocalFree(szArglist);
+                return 1;
+            }
+        } else {
+            if (inputPath == NULL) {
+                inputPath = szArglist[argIdx];
+            } else if (outputPath == NULL) {
+                outputPath = szArglist[argIdx];
+            }
+            argIdx++;
+        }
+    }
+
+    if (inputPath == NULL) {
+        // Default behavior: Process current directory recursively
+        WCHAR currentDir[MAX_PATH];
+        GetCurrentDirectoryW(MAX_PATH, currentDir);
+        process_path(currentDir, speed, NULL);
+    } else {
+        process_path(inputPath, speed, outputPath);
+    }
+
+    LocalFree(szArglist);
+    return 0;
 }

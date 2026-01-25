@@ -8,4 +8,8 @@ add_executable(jxr_to_avif main.c)
 find_library(AVIF_LIBRARY avif PATHS ${PROJECT_SOURCE_DIR}/lib REQUIRED NO_DEFAULT_PATH)
 find_library(AOM_LIBRARY aom PATHS ${PROJECT_SOURCE_DIR}/lib REQUIRED NO_DEFAULT_PATH)
 
-target_link_libraries(jxr_to_avif ${AVIF_LIBRARY} ${AOM_LIBRARY} "$<$<CONFIG:Release>:-s -static>")
+target_link_libraries(jxr_to_avif ${AVIF_LIBRARY} ${AOM_LIBRARY} windowscodecs ole32 oleaut32 uuid)
+
+if(MINGW)
+    target_link_options(jxr_to_avif PRIVATE -static)
+endif()
